@@ -23,14 +23,11 @@ import apoc.Pools;
 import apoc.SystemLabels;
 import apoc.SystemPropertyKeys;
 import apoc.util.MapUtil;
-import apoc.util.collection.Iterators;
 import apoc.util.Util;
+import apoc.util.collection.Iterators;
 import org.apache.commons.lang3.tuple.Pair;
 import org.neo4j.dbms.api.DatabaseManagementService;
-import org.neo4j.graphdb.GraphDatabaseService;
-import org.neo4j.graphdb.Node;
-import org.neo4j.graphdb.Result;
-import org.neo4j.graphdb.Transaction;
+import org.neo4j.graphdb.*;
 import org.neo4j.graphdb.event.TransactionData;
 import org.neo4j.graphdb.event.TransactionEventListener;
 import org.neo4j.kernel.lifecycle.LifecycleAdapter;
@@ -39,8 +36,7 @@ import org.neo4j.scheduler.Group;
 import org.neo4j.scheduler.JobHandle;
 import org.neo4j.scheduler.JobScheduler;
 
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -58,6 +54,7 @@ public class TriggerHandler extends LifecycleAdapter implements TransactionEvent
     public static final String TRIGGER_REFRESH = "apoc.trigger.refresh";
 
     private final ConcurrentHashMap<String, Map<String,Object>> activeTriggers = new ConcurrentHashMap();
+    private final ConcurrentHashMap<String, ReactiveTrigger> activeReactiveTriggers = new ConcurrentHashMap();
     private final Log log;
     private final GraphDatabaseService db;
     private final DatabaseManagementService databaseManagementService;
@@ -109,7 +106,8 @@ public class TriggerHandler extends LifecycleAdapter implements TransactionEvent
                                         "statement", node.getProperty(SystemPropertyKeys.statement.name()),
                                         "selector", Util.fromJson((String) node.getProperty(SystemPropertyKeys.selector.name()), Map.class),
                                         "params", Util.fromJson((String) node.getProperty(SystemPropertyKeys.params.name()), Map.class),
-                                        "paused", node.getProperty(SystemPropertyKeys.paused.name())
+                                        "paused", node.getProperty(SystemPropertyKeys.paused.name()),
+                                        "eventsToProcess", new ArrayList<>()
                                 )
                         );
                     }
@@ -211,13 +209,116 @@ public class TriggerHandler extends LifecycleAdapter implements TransactionEvent
         checkEnabled();
         return Map.copyOf(activeTriggers);
     }
+    
+    public <T> Set<T> toSet(Iterable<T> iterable) {
+        Iterator<T> iterator = iterable.iterator();
+        Set<T> set = new HashSet<>();
+        while (iterator.hasNext())
+            set.add(iterator.next());
+        return set;
+    }
+
+    public void dispatchNewEvents(Set<Entity> newEvents) {
+        activeReactiveTriggers.forEachValue(1, (trigger -> {
+            Set<Entity> newNodes = newEvents.stream().filter(event -> event instanceof Node).filter(node -> ((Node) node).hasLabel(Label.label(trigger.getEvent()))).collect(Collectors.toSet());
+            Set<Entity> newRels = newEvents.stream().filter(event -> event instanceof Relationship).filter(node -> ((Relationship) node).isType(RelationshipType.withName(trigger.getEvent()))).collect(Collectors.toSet());
+            trigger.enqueueNewEntitiesToProcess(newNodes);
+            trigger.enqueueNewEntitiesToProcess(newRels);
+        }));
+    }
 
     @Override
     public Void beforeCommit(TransactionData txData, Transaction transaction, GraphDatabaseService databaseService) {
         if (hasPhase(Phase.before)) {
-            executeTriggers(transaction, txData, Phase.before);
+
+            // Creating auxiliary trigger structures
+            for (Map.Entry<String, Map<String,Object>> trigger: activeTriggers.entrySet()) {
+                ReactiveTrigger reactiveTrigger = new ReactiveTrigger(
+                        trigger.getKey(),
+                        (String) trigger.getValue().get("statement"),
+                        (Map<String, Object>) trigger.getValue().get("params"),
+                        (Map<String, Object>) trigger.getValue().get("selector"),
+                        (Boolean) trigger.getValue().get("paused")
+                );
+                log.info(reactiveTrigger.getName());
+                activeReactiveTriggers.put(reactiveTrigger.name, reactiveTrigger);
+            }
+
+            // Identifying and sorting (ascending) trigger strata
+            List<Long> sortedStrata = identifyAndSortStrata();
+            log.info("Strata: " + sortedStrata);
+
+            // Creating set that is going to keep all the new entities added by the user first and by triggers later
+            log.info("Collecting initial events...");
+            Set<Entity> newEntitiesInTx = new HashSet<>();
+            txData.createdRelationships().forEach(newEntitiesInTx::add);
+            txData.createdNodes().forEach(newEntitiesInTx::add);
+
+            // Dispatching initial events (i.e. created relationships and nodes) inserted with user queries
+            log.info("Dispatching events...");
+            dispatchNewEvents(newEntitiesInTx);
+
+            // Stratum by stratum...
+            for (Long currentStratum : sortedStrata) {
+                log.info("Processing stratum: " + currentStratum);
+
+                Set<Entity> deltaSet;
+                do {
+                    // For each trigger sequentially activate it if possible
+                    activeReactiveTriggers.forEachValue(999, (trigger) -> {
+                        // Skip trigger activation if...
+                        // ... the trigger is not part of the current stratum
+                        if (!trigger.getStratum().equals(currentStratum)) return;
+                        // ... or it is paused
+                        if (trigger.getPaused()) return;
+                        // ... or it has not the 'before' phase
+                        if (!trigger.getPhase().equals("before")) return;
+                        // ... or its queue of events to process is empty
+                        if (trigger.entitiesToProcess.isEmpty()) {
+                            log.info(trigger.getName() + ": no events to process.");
+                            return;
+                        }
+                        // Otherwise, fire it
+                        executeSingleTrigger(trigger, transaction, Phase.before);
+                    });
+
+                    // Collecting new events generated by the triggers activation
+                    deltaSet = new HashSet<>();
+                    txData.createdRelationships().forEach(deltaSet::add);
+                    txData.createdNodes().forEach(deltaSet::add);
+
+                    // Collecting only actual new events and add them the set of new entities generated in the transaction
+                    deltaSet.removeAll(newEntitiesInTx);
+                    newEntitiesInTx.addAll(deltaSet);
+
+                    // Dispatch those new events
+                    dispatchNewEvents(deltaSet);
+
+                    //if the deltaSet is not empty it means we did not reach a quiescent state -> trigger in the current stratum must be activated at least once more
+                } while (!deltaSet.isEmpty());
+            }
         }
         return null;
+    }
+
+    private void executeSingleTrigger(ReactiveTrigger trigger, Transaction tx, Phase phase) {
+        Map<String, Object> params = new HashMap<>();
+        log.info("ReactiveTrigger - Executing trigger: " + trigger.getName());
+        try {
+            params.put("trigger", trigger.getName());
+            params.put("createdNodes", trigger.getEntitiesToProcess().stream().filter(entity -> entity instanceof Node).map(node -> (Node) node));
+            params.put("createdRelationships", trigger.getEntitiesToProcess().stream().filter(entity -> entity instanceof Relationship).map(rel -> (Relationship) rel));
+            Result result = tx.execute(trigger.getStatement(), params);
+            Iterators.count(result);
+            trigger.emptyEntitiesToProcess();
+        } catch (Exception e) {
+            log.warn("Error executing trigger " + trigger.getName() + " in phase " + phase, e);
+            throw new RuntimeException("Error executing trigger '" +trigger.getName()+"': " + e.getMessage());
+        }
+    }
+
+    private List<Long> identifyAndSortStrata() {
+        return activeReactiveTriggers.values().stream().map(ReactiveTrigger::getStratum).distinct().sorted().collect(Collectors.toList());
     }
 
     @Override
