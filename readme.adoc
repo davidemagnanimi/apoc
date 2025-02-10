@@ -38,6 +38,89 @@ MERGE (x)-[:potDControl]->(y)",
 ----
 
 
+== Reasoning over the Ownership Knowledge Graph
+
+In this section, we report some examples of reasoning financial applications based on the definition of deductive rules, as published in relevant academic papers.
+We consider an ownership graph, having companies as nodes and shares as edges. With this apoc, you can run deductive rules directly in Neo4j, through triggers.
+
+=== Close Links
+In the creditworthiness evaluation, particularly within the Eurosystem, the issue of collateral eligibility is crucial 
+for determining the risk associated with granting loans backed by collateral from another entity. According to European 
+Central Bank regulations (http://data.europa.eu/eli/guideline/2015/510/o), National Central Banks must adhere to specific criteria to assess asset eligibility
+(https://www.ecb.europa.eu/pub/pdf/scpops/ecbocp148.pdf), notably excluding collateral from a guarantor with 
+which the borrower has a "close links" relationship. This relationship is defined by either party holding more 
+than 20\% equity in the other, or a third party owning 20% or more of both entities' equity. This ensures that 
+the collateral backing a loan is sufficiently independent and reduces the risk of biased or inflated valuations 
+due to interconnected financial interests. The close links problem can be formalized as the following 
+set of reasoning rules (https://ceur-ws.org/Vol-3135/EcoFinKG_2022_paper7.pdf):
+
+[source,datalog,subs=attributes]
+----
+IntOwns(x , y, s), s ≥ 0.2 → CloseLink (x , y)
+IntOwns(z , x , s), IntOwns(z , y, t), s ≥ 0.2, t ≥ 0.2, x <> y, x <> z, y <> z → CloseLink (x, y)
+CloseLink (y, x) → CloseLink (x , y)
+----
+
+Here, IntOwns(x,y,s) indicates that the integrated ownership share of company x over company y is s. 
+
+These rules can be translated to the following Cypher trigger statements:
+
+
+[source,cypher,subs=attributes]
+----
+MATCH (x:Company)-[i:intOwns]->(y:Company)
+WHERE i.share >= 0.2
+MERGE (x)-[:closeLink]->(y)
+----
+
+[source,cypher,subs=attributes]
+----
+MATCH (z:Company)-[i1:intOwns]->(x:Company), 
+       (z)-[i2:intOwns]->(y:Company)
+WHERE i1.share >= 0.2 AND i2.share >= 0.2
+  AND x != z AND x != z AND y != z
+MERGE (x)-[:closeLink]->(y)
+----
+
+[source,cypher,subs=attributes]
+----
+UNWIND $createdRelationships AS newRel
+MATCH (y:Company)-[newRel:closeLink]->(x:Company)
+MERGE (x)-[:closeLink]->(y)
+----
+
+which allow to detect close links among companies.
+
+=== Golden Power
+The Golden Power legal framework, developed by the Italian Government, safeguards national economic
+stability by enabling the veto of acquisitions that could lead to hostile takeovers of strategic assets, a concern heightened
+during economic turmoils. The complexity of detecting such transactions necessitates advanced tools to assist policymakers.
+Deductive AI systems may come to the rescue by reactively analysing acquisition proposals Tx from attacking companies
+V, and identifying control shifts towards strategic companies T. If the analysis detects potential vulnerabilities, the AI
+system triggers an alert, suggesting the need to exercise the Golden Power to prevent the acquisition Tx. The following
+deductive rules realize the alert mechanism (https://ceur-ws.org/Vol-2644/paper41.pdf):
+
+[source,datalog,subs=attributes]
+----
+V(x), ¬V(y), Tx(x, y, w) → Own(x, y, w) 
+V(x), T(y), Control(x, y) → GPCheck(x, y) 
+----
+
+In this application, the corresponding Cypher trigger statements that implement the alert mechanism are:
+.
+[source,cypher,subs=attributes]
+----
+MATCH (x:V), (x)-[t:Tx]->(y:Company)
+WHERE NOT (y:V)
+MERGE (x)-[:own{w: t.w}]->(y)
+----
+
+[source,cypher,subs=attributes]
+----
+UNWIND $createdRelationships AS newRel
+MATCH (x:V), (y:T), (x)-[newRel:newControl]->(y)
+MERGE (x)-[:gpcheck]->(y)
+----
 
 == Disclaimer
 
